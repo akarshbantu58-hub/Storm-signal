@@ -2,6 +2,7 @@ package com.stormsignal.app
 
 import android.Manifest
 import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -14,6 +15,7 @@ import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -25,7 +27,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -35,13 +39,21 @@ private val Panel = Color(0xFF121B2B)
 private val Cyan = Color(0xFF48DDF5)
 private val Muted = Color(0xFF9BAAC1)
 
+private data class SignalReading(
+    val name: String,
+    val source: String,
+    val rssi: Int,
+    val frequency: String,
+    val history: List<Int>
+)
+
 class MainActivity : ComponentActivity() {
-    private val handler = Handler(Looper.getMainLooper())
     private var scanning by mutableStateOf(false)
-    private var status by mutableStateOf("Ready — choose a monitor")
-    private val devices = mutableStateListOf<String>()
-    private var wifiSummary by mutableStateOf("Not scanned yet")
+    private var status by mutableStateOf("Ready — start a Bluetooth or Wi-Fi monitor")
+    private val bleSignals = mutableStateMapOf<String, SignalReading>()
+    private val wifiSignals = mutableStateMapOf<String, SignalReading>()
     private var pendingAction: (() -> Unit)? = null
+    private var bleScanner: BluetoothLeScanner? = null
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -66,9 +78,12 @@ class MainActivity : ComponentActivity() {
                 Dashboard(
                     status = status,
                     scanning = scanning,
-                    devices = devices.toList(),
-                    wifiSummary = wifiSummary,
-                    onBluetoothScan = { runWithPermissions(bluetoothPermissions()) { startBluetoothScan() } },
+                    bleSignals = bleSignals.values.sortedByDescending { it.rssi },
+                    wifiSignals = wifiSignals.values.sortedByDescending { it.rssi },
+                    onBluetoothToggle = {
+                        if (scanning) stopBluetoothScan()
+                        else runWithPermissions(bluetoothPermissions()) { startBluetoothScan() }
+                    },
                     onWifiScan = { runWithPermissions(wifiPermissions()) { scanWifi() } }
                 )
             }
@@ -103,20 +118,15 @@ class MainActivity : ComponentActivity() {
                 status = "Turn Bluetooth on in Android Settings first"
                 return
             }
-            val scanner = adapter.bluetoothLeScanner
-            if (scanner == null) {
+            bleScanner = adapter.bluetoothLeScanner
+            if (bleScanner == null) {
                 status = "Bluetooth LE scanner unavailable"
                 return
             }
-            devices.clear()
+            bleSignals.clear()
             scanning = true
-            status = "Scanning nearby Bluetooth LE advertisements for 10 seconds…"
-            scanner.startScan(scanCallback)
-            handler.postDelayed({
-                try { scanner.stopScan(scanCallback) } catch (_: SecurityException) { }
-                scanning = false
-                status = "Bluetooth scan complete — " + devices.size + " result(s)"
-            }, 10_000)
+            status = "Live BLE scan running — tap Stop to finish"
+            bleScanner?.startScan(scanCallback)
         } catch (_: SecurityException) {
             scanning = false
             status = "Bluetooth permission denied"
@@ -126,10 +136,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun stopBluetoothScan() {
+        try { bleScanner?.stopScan(scanCallback) } catch (_: Exception) { }
+        scanning = false
+        status = "Bluetooth scan stopped — " + bleSignals.size + " device(s) observed"
+    }
+
     private fun addDevice(result: ScanResult) {
-        val name = try { result.device.name ?: "Unnamed device" } catch (_: SecurityException) { "Unnamed device" }
-        val entry = name + " • RSSI " + result.rssi + " dBm"
-        if (!devices.contains(entry)) devices.add(entry)
+        try {
+            val device = result.device
+            val advertisedName = result.scanRecord?.deviceName
+            val name = advertisedName ?: device.name
+            val key = device.address
+            val displayName = name?.takeIf { it.isNotBlank() } ?: "Unnamed BLE device"
+            val previous = bleSignals[key]
+            val history = ((previous?.history ?: emptyList()) + result.rssi).takeLast(30)
+            bleSignals[key] = SignalReading(
+                name = displayName,
+                source = "Bluetooth LE",
+                rssi = result.rssi,
+                frequency = "2.4 GHz band; exact channel not exposed by Android",
+                history = history
+            )
+        } catch (_: SecurityException) {
+            status = "Bluetooth permission is required to read scan results"
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -137,34 +168,40 @@ class MainActivity : ComponentActivity() {
         try {
             val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             if (!wifi.isWifiEnabled) {
-                wifiSummary = "Turn Wi-Fi on in Android Settings first"
+                status = "Turn Wi-Fi on in Android Settings first"
                 return
             }
-            wifi.startScan()
+            val started = wifi.startScan()
             val results = wifi.scanResults
-            wifiSummary = if (results.isEmpty()) {
-                "No results available yet. Try again shortly; Android may throttle scans."
-            } else {
-                results.sortedByDescending { it.level }.take(12).joinToString("\n") { result ->
-                    val label = result.SSID.ifBlank { "Hidden network" }
-                    label + " • " + result.level + " dBm • " + result.frequency + " MHz"
-                }
+            if (results.isEmpty()) {
+                status = if (started) "Wi-Fi scan requested; waiting for Android results" else
+                    "Android is throttling Wi-Fi scans; showing no new results yet"
+                return
             }
-            status = "Wi-Fi scan requested — Android controls scan timing"
+            results.forEach { result ->
+                val ssid = result.SSID.takeIf { it.isNotBlank() } ?: "Hidden Wi-Fi network"
+                val key = result.BSSID ?: ssid
+                val previous = wifiSignals[key]
+                val history = ((previous?.history ?: emptyList()) + result.level).takeLast(30)
+                wifiSignals[key] = SignalReading(
+                    name = ssid,
+                    source = "Wi-Fi access point",
+                    rssi = result.level,
+                    frequency = result.frequency.toString() + " MHz",
+                    history = history
+                )
+            }
+            status = "Wi-Fi results updated — Android may limit scan frequency"
         } catch (_: SecurityException) {
-            wifiSummary = "Permission denied. Allow nearby Wi-Fi/location permissions."
+            status = "Permission denied. Allow nearby Wi-Fi/location permissions."
         } catch (e: Exception) {
-            wifiSummary = "Wi-Fi scan unavailable: " + (e.message ?: "unknown error")
+            status = "Wi-Fi scan unavailable: " + (e.message ?: "unknown error")
         }
     }
 
     override fun onDestroy() {
+        try { bleScanner?.stopScan(scanCallback) } catch (_: Exception) { }
         super.onDestroy()
-        handler.removeCallbacksAndMessages(null)
-        try {
-            val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-            manager.adapter?.bluetoothLeScanner?.stopScan(scanCallback)
-        } catch (_: Exception) { }
     }
 }
 
@@ -172,9 +209,9 @@ class MainActivity : ComponentActivity() {
 private fun Dashboard(
     status: String,
     scanning: Boolean,
-    devices: List<String>,
-    wifiSummary: String,
-    onBluetoothScan: () -> Unit,
+    bleSignals: List<SignalReading>,
+    wifiSignals: List<SignalReading>,
+    onBluetoothToggle: () -> Unit,
     onWifiScan: () -> Unit
 ) {
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
@@ -183,46 +220,96 @@ private fun Dashboard(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text("STORMSIGNAL", color = Cyan, fontSize = 28.sp)
-            Text("RADIO ENVIRONMENT MONITOR", color = Muted, fontSize = 12.sp)
+            Text("LIVE RADIO ENVIRONMENT MONITOR", color = Muted, fontSize = 12.sp)
             Card(colors = CardDefaults.cardColors(containerColor = Panel)) {
                 Column(Modifier.padding(18.dp)) {
                     Text("SYSTEM STATUS", color = Cyan)
                     Spacer(Modifier.height(8.dp))
-                    Text(if (scanning) "MONITORING" else "STANDBY")
+                    Text(if (scanning) "LIVE MONITORING" else "STANDBY")
                     Text(status, color = Muted, fontSize = 13.sp)
+                    Text("Closer to 0 dBm usually means a stronger received signal", color = Muted, fontSize = 11.sp)
                 }
             }
             MonitorCard(
-                title = "Bluetooth LE",
-                description = "Nearby BLE advertisements and received signal strength",
+                title = "Bluetooth LE — live",
+                description = "Nearby BLE advertisements, names and rolling RSSI graphs",
                 icon = { Icon(Icons.Filled.Bluetooth, contentDescription = null, tint = Cyan) },
-                buttonText = if (scanning) "Scanning…" else "Scan Bluetooth",
-                onClick = onBluetoothScan,
-                enabled = !scanning
+                buttonText = if (scanning) "Stop live scan" else "Start live scan",
+                onClick = onBluetoothToggle
             )
-            if (devices.isNotEmpty()) ResultCard("BLUETOOTH RESULTS", devices)
+            if (bleSignals.isEmpty()) {
+                Text("Bluetooth: no readings yet. Start the live scan and keep nearby devices advertising.", color = Muted, fontSize = 12.sp)
+            } else {
+                bleSignals.forEach { SignalCard(it) }
+            }
             MonitorCard(
-                title = "Wi-Fi",
-                description = "Android-reported network names, signal level and frequency",
+                title = "Wi-Fi — nearby access points",
+                description = "Network/SSID name, signal level and channel frequency",
                 icon = { Icon(Icons.Filled.Wifi, contentDescription = null, tint = Cyan) },
-                buttonText = "Scan Wi-Fi",
+                buttonText = "Refresh Wi-Fi readings",
                 onClick = onWifiScan
             )
-            ResultCard("WI-FI RESULTS", wifiSummary.split("\n"))
+            if (wifiSignals.isEmpty()) {
+                Text("Wi-Fi results appear after Android provides a scan. Android may throttle refreshes.", color = Muted, fontSize = 12.sp)
+            } else {
+                wifiSignals.forEach { SignalCard(it) }
+            }
             MonitorCard(
-                title = "Signal Analysis",
-                description = "RSSI is approximate and varies with walls, orientation and hardware",
+                title = "Coverage and limitations",
+                description = "Built-in tablet radios do not expose a full-spectrum RF analyzer",
                 icon = { Icon(Icons.Filled.Insights, contentDescription = null, tint = Cyan) },
-                buttonText = "Analysis info",
+                buttonText = "Limitations",
                 onClick = { }
             )
-            HorizontalDivider(color = Panel)
             Text(
-                "Read-only monitoring • No radio interference",
+                "Names appear only when broadcast or exposed by Android. This tablet cannot scan arbitrary RF bands; Wi-Fi graphs update when Android returns scans, while BLE graphs update as packets arrive. Read-only monitoring — no interference.",
                 color = Muted,
-                fontSize = 12.sp,
-                modifier = Modifier.align(Alignment.CenterHorizontally)
+                fontSize = 12.sp
             )
+        }
+    }
+}
+
+@Composable
+private fun SignalCard(signal: SignalReading) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel)) {
+        Column(
+            Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(signal.name, color = Color.White, fontSize = 15.sp)
+            Text(signal.source + " • " + signal.rssi + " dBm", color = Cyan, fontSize = 12.sp)
+            Text("Frequency: " + signal.frequency, color = Muted, fontSize = 11.sp)
+            Text("Recent strength history", color = Muted, fontSize = 10.sp)
+            SignalGraph(signal.history)
+            Text("Graph range: −100 to −30 dBm • latest sample " + signal.rssi + " dBm", color = Muted, fontSize = 10.sp)
+        }
+    }
+}
+
+@Composable
+private fun SignalGraph(history: List<Int>) {
+    Canvas(modifier = Modifier.fillMaxWidth().height(72.dp)) {
+        val minDbm = -100f
+        val maxDbm = -30f
+        for (dbm in listOf(-90f, -70f, -50f)) {
+            val y = size.height * (maxDbm - dbm) / (maxDbm - minDbm)
+            drawLine(color = Muted.copy(alpha = 0.22f), start = Offset(0f, y), end = Offset(size.width, y), strokeWidth = 1.dp.toPx())
+        }
+        if (history.isEmpty()) return@Canvas
+        val points = history.mapIndexed { index, value ->
+            val x = if (history.size == 1) size.width else size.width * index / (history.size - 1).toFloat()
+            val bounded = value.coerceIn(minDbm.toInt(), maxDbm.toInt()).toFloat()
+            val y = size.height * (maxDbm - bounded) / (maxDbm - minDbm)
+            Offset(x, y)
+        }
+        if (points.size == 1) {
+            drawCircle(color = Cyan, radius = 4.dp.toPx(), center = points.first())
+        } else {
+            points.zipWithNext().forEach { (a, b) ->
+                drawLine(color = Cyan, start = a, end = b, strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+            }
+            drawCircle(color = Cyan, radius = 3.dp.toPx(), center = points.last())
         }
     }
 }
@@ -233,8 +320,7 @@ private fun MonitorCard(
     description: String,
     icon: @Composable () -> Unit,
     buttonText: String,
-    onClick: () -> Unit,
-    enabled: Boolean = true
+    onClick: () -> Unit
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = Panel)) {
         Column(
@@ -250,22 +336,8 @@ private fun MonitorCard(
             }
             Button(
                 onClick = onClick,
-                enabled = enabled,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF193D52))
             ) { Text(buttonText, color = Cyan) }
-        }
-    }
-}
-
-@Composable
-private fun ResultCard(title: String, lines: List<String>) {
-    Card(colors = CardDefaults.cardColors(containerColor = Panel)) {
-        Column(
-            Modifier.fillMaxWidth().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(7.dp)
-        ) {
-            Text(title, color = Cyan, fontSize = 12.sp)
-            lines.forEach { Text(it, color = Muted, fontSize = 12.sp) }
         }
     }
 }
