@@ -44,6 +44,7 @@ private data class SignalReading(
     val source: String,
     val rssi: Int,
     val frequency: String,
+    val security: String,
     val history: List<Int>
 )
 
@@ -156,6 +157,7 @@ class MainActivity : ComponentActivity() {
                 source = "Bluetooth LE",
                 rssi = result.rssi,
                 frequency = "2.4 GHz band; exact channel not exposed by Android",
+                security = "Not applicable",
                 history = history
             )
         } catch (_: SecurityException) {
@@ -188,6 +190,7 @@ class MainActivity : ComponentActivity() {
                     source = "Wi-Fi access point",
                     rssi = result.level,
                     frequency = result.frequency.toString() + " MHz",
+                    security = securityLabel(result.capabilities),
                     history = history
                 )
             }
@@ -196,6 +199,19 @@ class MainActivity : ComponentActivity() {
             status = "Permission denied. Allow nearby Wi-Fi/location permissions."
         } catch (e: Exception) {
             status = "Wi-Fi scan unavailable: " + (e.message ?: "unknown error")
+        }
+    }
+
+    private fun securityLabel(capabilities: String): String {
+        val caps = capabilities.uppercase()
+        return when {
+            "WPA3" in caps || "SAE" in caps -> "WPA3"
+            "WPA2" in caps && "WPA" in caps -> "WPA2"
+            "WPA" in caps -> "WPA/WPA2"
+            "WEP" in caps -> "WEP — legacy / weak"
+            "OWE" in caps -> "Enhanced Open (OWE)"
+            "EAP" in caps -> "Enterprise (802.1X)"
+            else -> "Open / no security advertised"
         }
     }
 
@@ -244,7 +260,7 @@ private fun Dashboard(
             }
             MonitorCard(
                 title = "Wi-Fi — nearby access points",
-                description = "Network/SSID name, signal level and channel frequency",
+                description = "SSID, signal, frequency and advertised Wi-Fi security",
                 icon = { Icon(Icons.Filled.Wifi, contentDescription = null, tint = Cyan) },
                 buttonText = "Refresh Wi-Fi readings",
                 onClick = onWifiScan
@@ -262,7 +278,7 @@ private fun Dashboard(
                 onClick = { }
             )
             Text(
-                "Names appear only when broadcast or exposed by Android. This tablet cannot scan arbitrary RF bands; Wi-Fi graphs update when Android returns scans, while BLE graphs update as packets arrive. Read-only monitoring — no interference.",
+                "Wi-Fi passwords are not broadcast in scan results. This app reports only advertised security, not passwords. To view your own saved network password, open Android Settings → Wi-Fi → tap your connected network or its gear icon → Share/QR code (availability varies by device). Names appear only when broadcast or exposed by Android. Read-only monitoring — no interference.",
                 color = Muted,
                 fontSize = 12.sp
             )
@@ -280,6 +296,7 @@ private fun SignalCard(signal: SignalReading) {
             Text(signal.name, color = Color.White, fontSize = 15.sp)
             Text(signal.source + " • " + signal.rssi + " dBm", color = Cyan, fontSize = 12.sp)
             Text("Frequency: " + signal.frequency, color = Muted, fontSize = 11.sp)
+            Text("Security: " + signal.security, color = if (signal.security.contains("legacy") || signal.security.startsWith("Open")) Color(0xFFFFC36B) else Muted, fontSize = 11.sp)
             Text("Recent strength history", color = Muted, fontSize = 10.sp)
             SignalGraph(signal.history)
             Text("Graph range: −100 to −30 dBm • latest sample " + signal.rssi + " dBm", color = Muted, fontSize = 10.sp)
