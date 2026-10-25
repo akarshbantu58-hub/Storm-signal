@@ -6,12 +6,14 @@ import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -85,7 +87,8 @@ class MainActivity : ComponentActivity() {
                         if (scanning) stopBluetoothScan()
                         else runWithPermissions(bluetoothPermissions()) { startBluetoothScan() }
                     },
-                    onWifiScan = { runWithPermissions(wifiPermissions()) { scanWifi() } }
+                    onWifiScan = { runWithPermissions(wifiPermissions()) { scanWifi() } },
+                    onOwnWifiPassword = { openOwnWifiSettings() }
                 )
             }
         }
@@ -202,6 +205,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun openOwnWifiSettings() {
+        status = "In Android Wi-Fi settings, choose your own connected network and use Share/QR code if available"
+        try {
+            startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+        } catch (_: Exception) {
+            status = "Could not open Wi-Fi settings. Open Android Settings → Wi-Fi manually."
+        }
+    }
+
     private fun securityLabel(capabilities: String): String {
         val caps = capabilities.uppercase()
         return when {
@@ -228,7 +240,8 @@ private fun Dashboard(
     bleSignals: List<SignalReading>,
     wifiSignals: List<SignalReading>,
     onBluetoothToggle: () -> Unit,
-    onWifiScan: () -> Unit
+    onWifiScan: () -> Unit,
+    onOwnWifiPassword: () -> Unit
 ) {
     Surface(modifier = Modifier.fillMaxSize(), color = Background) {
         Column(
@@ -278,10 +291,16 @@ private fun Dashboard(
                 onClick = { }
             )
             Text(
-                "Wi-Fi passwords are not broadcast in scan results. This app reports only advertised security, not passwords. To view your own saved network password, open Android Settings → Wi-Fi → tap your connected network or its gear icon → Share/QR code (availability varies by device). Names appear only when broadcast or exposed by Android. Read-only monitoring — no interference.",
+                "Passwords are not broadcast by nearby Wi-Fi networks. To access a password for your own network, use Android's built-in Share/QR-code option. This app cannot extract other networks' credentials.",
                 color = Muted,
                 fontSize = 12.sp
             )
+            Button(
+                onClick = onOwnWifiPassword,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF193D52))
+            ) {
+                Text("Open Wi-Fi settings for my network", color = Cyan)
+            }
         }
     }
 }
